@@ -1,0 +1,488 @@
+import argparse
+import sys
+from pathlib import Path
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from notebooklm_tools.core.auth import AuthManager
+from notebooklm_tools.core.client import NotebookLMClient
+from notebooklm_tools.core.errors import ClientAuthenticationError
+from notebooklm_tools.core.exceptions import NLMError
+from notebooklm_tools.services import sources as sources_service
+
+
+console = Console()
+err_console = Console(stderr=True)
+
+
+PLAN_LIMITS = {
+    "standard": 50,
+    "pro": 300,
+    "ultra": 600,
+}
+
+READY_STATUSES = {"ready", "available", "success", "present", "1", "2", "true", "yes"}
+
+
+def print_section(title: str, message: str) -> None:
+    console.print(Panel(message, title=title, border_style="blue"))
+
+
+def print_error(message: str) -> None:
+    err_console.print(f"[red]Error:[/red] {message}")
+
+
+def print_success(message: str) -> None:
+    console.print(f"[green]OK[/green] {message}")
+
+
+def print_warning(message: str) -> None:
+    console.print(f"[yellow]WARN[/yellow] {message}")
+
+
+def print_auth_error(profile_name: str, error: Exception) -> None:
+    console.print(
+        Panel(
+            f"[bold red]Authentication expired[/bold red]\n\n"
+            f"Profile: [cyan]{profile_name}[/cyan]\n"
+            f"Details: {error}\n\n"
+            f"Run [bold]nlm login --profile {profile_name}[/bold] and retry.",
+            title="Auth Error",
+            border_style="red",
+        )
+    )
+
+
+def print_quota_check(
+    profile_name: str,
+    notebook_id: str,
+    plan_name: str,
+    plan_limit: int,
+    existing_count: int,
+    requested_count: int | None = None,
+) -> None:
+    projected_total = existing_count + (requested_count or 0)
+    available_quota = max(plan_limit - existing_count, 0)
+
+    body_lines = [
+        f"[bold]Profile:[/bold] {profile_name}",
+        f"[bold]Notebook ID:[/bold] {notebook_id}",
+        f"[bold]Plan:[/bold] {plan_name} (max {plan_limit} sources)",
+        f"[bold]Existing sources:[/bold] {existing_count}",
+        f"[bold]Available upload quota:[/bold] {available_quota}",
+    ]
+    if requested_count is not None:
+        body_lines.extend(
+            [
+                f"[bold]Requested new uploads:[/bold] {requested_count}",
+                f"[bold]Projected total:[/bold] {projected_total}",
+            ]
+        )
+
+    console.print(Panel("\n".join(body_lines), title="Quota Check", border_style="blue"))
+
+
+def get_status_style(status: str) -> str:
+    normalized = status.strip().lower()
+    if normalized in READY_STATUSES:
+        return "green"
+    if normalized in {"failed", "fail", "error"}:
+        return "red"
+    if normalized in {"skipped", "duplicate", "existing"}:
+        return "yellow"
+    return "cyan"
+
+
+def render_sources_table(
+    sources: list[dict],
+    title: str = "Sources",
+    status_label: str = "available",
+) -> None:
+    table = Table(title=title, show_lines=False, header_style="bold magenta")
+    table.add_column("Source ID", style="dim", no_wrap=True)
+    table.add_column("File Name", style="bold")
+    table.add_column("Status", style="green", no_wrap=True)
+
+    if not sources:
+        console.print(table)
+        return
+
+    for source in sources:
+        file_name = str(source.get("title", "Untitled"))
+        raw_status = source.get("status", status_label)
+        status_value = str(raw_status)
+        status_style = get_status_style(status_value)
+        if raw_status == 2 or status_value.strip().lower() in READY_STATUSES:
+            status_display = "[green]✓[/green]"
+        else:
+            status_display = f"[{status_style}]{status_value}[/{status_style}]"
+        table.add_row(
+            str(source.get("id", "unknown")),
+            file_name,
+            status_display,
+        )
+
+    console.print(table)
+
+
+def get_authenticated_profile(profile_name: str):
+    """Load an auth profile with actionable errors."""
+    manager = AuthManager(profile_name)
+    if not manager.profile_exists():
+        raise SystemExit(
+            f"Profile '{profile_name}' not found. Run: nlm login --profile {profile_name}"
+        )
+
+    try:
+        profile = manager.load_profile()
+    except Exception as exc:
+        raise SystemExit(
+            f"Failed to load profile '{profile_name}': {exc}\n"
+            f"Try re-authenticating: nlm login --profile {profile_name}"
+        ) from exc
+
+    if not profile.cookies:
+        raise SystemExit(
+            f"Profile '{profile_name}' has no cookies. "
+            f"Run: nlm login --profile {profile_name}"
+        )
+
+    return profile
+
+
+def collect_pdf_files(folder: Path) -> list[Path]:
+    """Collect PDF files from a folder."""
+    resolved = folder.expanduser().resolve()
+    if not resolved.exists():
+        raise SystemExit(f"Folder not found: {resolved}")
+    if not resolved.is_dir():
+        raise SystemExit(f"Not a directory: {resolved}")
+
+    pdf_files = sorted(resolved.glob("*.pdf"))
+    if not pdf_files:
+        raise SystemExit(f"No PDF files found in: {resolved}")
+
+    return pdf_files
+
+
+def create_client(profile_name: str) -> NotebookLMClient:
+    profile = get_authenticated_profile(profile_name)
+    return NotebookLMClient(
+        cookies=profile.cookies,
+        csrf_token=profile.csrf_token or "",
+        session_id=profile.session_id or "",
+        build_label=profile.build_label or "",
+    )
+
+
+def cmd_upload(args: argparse.Namespace) -> None:
+    pdf_files = collect_pdf_files(Path(args.pdf_folder))
+    plan_limit = PLAN_LIMITS[args.plan]
+
+    print_section(
+        "Upload",
+        f"[bold]PDFs found:[/bold] {len(pdf_files)}",
+    )
+
+    with create_client(args.profile) as client:
+        existing_sources = client.get_notebook_sources_with_types(args.notebook_id)
+        existing_ids = {str(source.get("id")) for source in existing_sources if source.get("id")}
+        existing_by_title = {
+            str(source.get("title", "")).strip().lower(): source
+            for source in existing_sources
+            if source.get("title")
+        }
+
+        files_to_upload: list[Path] = []
+        skipped_files: list[Path] = []
+        already_present_sources: list[dict] = []
+        for file_path in pdf_files:
+            existing_match = existing_by_title.get(file_path.name.strip().lower())
+            if existing_match:
+                skipped_files.append(file_path)
+                already_present_sources.append(existing_match)
+            else:
+                files_to_upload.append(file_path)
+
+        existing_count = len(existing_sources)
+        requested_count = len(files_to_upload)
+        projected_total = existing_count + requested_count
+        available_quota = max(plan_limit - existing_count, 0)
+
+        print_quota_check(
+            args.profile,
+            args.notebook_id,
+            args.plan,
+            plan_limit,
+            existing_count,
+            requested_count,
+        )
+        if skipped_files:
+            print_section("Already Present", f"Matched files already in the notebook: {len(skipped_files)}")
+            render_sources_table(already_present_sources, title="Already Present", status_label="present")
+
+        if projected_total > plan_limit:
+            print_error(
+                "Upload would exceed the plan limit. "
+                f"Limit={plan_limit}, projected={projected_total}."
+            )
+            print_warning(
+                "Reduce files to upload, remove existing sources, or use --plan pro/ultra."
+            )
+            sys.exit(1)
+
+        if not files_to_upload:
+            print_success("No new files to upload.")
+            return
+
+        console.print()
+        success_count = 0
+        success_ids: set[str] = set()
+        failed_files: list[Path] = []
+        for file_path in files_to_upload:
+            console.print(f"[bold blue]Uploading:[/bold blue] {file_path.name}")
+            try:
+                result = sources_service.add_source(
+                    client,
+                    notebook_id=args.notebook_id,
+                    source_type="file",
+                    file_path=str(file_path),
+                    wait=True,
+                )
+                source_id = result.get("source_id", "unknown")
+                title = result.get("title", file_path.name)
+                print_success(f"{title} is ready")
+                console.print(f"  [dim]Source ID:[/dim] {source_id}")
+                if source_id != "unknown":
+                    success_ids.add(str(source_id))
+                success_count += 1
+            except NLMError as exc:
+                print_error(f"{file_path.name}")
+                err_console.print(f"  [red]Details:[/red] {exc}")
+                failed_files.append(file_path)
+            except Exception as exc:
+                print_error(f"{file_path.name}")
+                err_console.print(f"  [red]Details:[/red] {exc}")
+                failed_files.append(file_path)
+
+        # Cleanup stage after all uploads: remove any newly-created source
+        # that did not complete successfully.
+        if failed_files:
+            console.print()
+            print_section("Cleanup", "Running cleanup for failed uploads")
+            try:
+                post_sources = client.get_notebook_sources_with_types(args.notebook_id)
+                post_by_id = {
+                    str(source.get("id")): source
+                    for source in post_sources
+                    if source.get("id")
+                }
+                new_ids = set(post_by_id.keys()) - existing_ids
+                cleanup_ids = new_ids - success_ids
+
+                if not cleanup_ids:
+                    print("  No cleanup targets found")
+                else:
+                    cleaned = 0
+                    for source_id in sorted(cleanup_ids):
+                        try:
+                            client.delete_source(source_id)
+                            cleaned += 1
+                            title = post_by_id.get(source_id, {}).get("title", "Untitled")
+                            print_success(f"Cleanup removed {title} ({source_id})")
+                        except Exception as exc:
+                            print_error(f"Cleanup failed for {source_id}: {exc}")
+                    console.print(f"[bold]Cleanup complete:[/bold] {cleaned}/{len(cleanup_ids)} removed")
+            except Exception as exc:
+                print_error(f"Cleanup stage failed: {exc}")
+
+        console.print()
+        print_section(
+            "Upload Summary",
+            f"[bold]Ready:[/bold] {success_count}/{len(files_to_upload)}\n"
+            f"[bold]Skipped:[/bold] {len(skipped_files)}\n"
+            f"[bold]Failed:[/bold] {len(failed_files)}",
+        )
+
+        # List all sources currently available in the notebook.
+        console.print()
+        print_section("Notebook Sources", "Current sources in the notebook")
+        sources = client.get_notebook_sources_with_types(args.notebook_id)
+        render_sources_table(sources, title="Sources currently in notebook", status_label="available")
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    plan_limit = PLAN_LIMITS[args.plan]
+    print_section("List", "Notebook source listing")
+
+    with create_client(args.profile) as client:
+        sources = client.get_notebook_sources_with_types(args.notebook_id)
+        print_quota_check(
+            args.profile,
+            args.notebook_id,
+            args.plan,
+            plan_limit,
+            len(sources),
+        )
+
+    if not sources:
+        print_success("No sources found")
+        return
+
+    render_sources_table(sources, title="Sources", status_label="available")
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    print_section("Remove", "Source removal")
+
+    with create_client(args.profile) as client:
+        source_ids: list[str]
+        if args.remove_all:
+            if not args.notebook_id:
+                print_error("--notebook-id is required when using --all")
+                sys.exit(1)
+
+            notebook_sources = client.get_notebook_sources_with_types(args.notebook_id)
+            source_ids = [str(source.get("id")) for source in notebook_sources if source.get("id")]
+            print_quota_check(
+                args.profile,
+                args.notebook_id,
+                "standard",
+                PLAN_LIMITS["standard"],
+                len(notebook_sources),
+            )
+            console.print(f"[bold]Removing all sources:[/bold] {len(source_ids)}")
+            if not source_ids:
+                print_success("No sources found to remove")
+                return
+        else:
+            source_ids = args.source_ids or []
+            console.print(f"[bold]Removing sources:[/bold] {len(source_ids)}")
+
+        removed_count = 0
+        for source_id in source_ids:
+            console.print(f"[blue]Removing:[/blue] {source_id}")
+            try:
+                client.delete_source(source_id)
+                print_success(f"Removed {source_id}")
+                removed_count += 1
+            except NLMError as exc:
+                print_error(source_id)
+                err_console.print(f"  [red]Details:[/red] {exc}")
+            except Exception as exc:
+                print_error(source_id)
+                err_console.print(f"  [red]Details:[/red] {exc}")
+
+    console.print(f"[bold]Remove complete:[/bold] {removed_count}/{len(source_ids)} removed")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="nlmsource",
+        description="Source management CLI for NotebookLM",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    upload_parser = subparsers.add_parser("upload", help="Upload PDFs from a folder")
+    upload_parser.add_argument(
+        "--notebook-id",
+        type=str,
+        required=True,
+        help="NotebookLM notebook ID (required)",
+    )
+    upload_parser.add_argument(
+        "--pdf-folder",
+        type=str,
+        required=True,
+        help="Path to folder containing PDF files (required)",
+    )
+    upload_parser.add_argument(
+        "--profile",
+        type=str,
+        default="default",
+        help="Auth profile name (default: default)",
+    )
+    upload_parser.add_argument(
+        "--plan",
+        type=str,
+        default="standard",
+        choices=["standard", "pro", "ultra"],
+        help="NotebookLM plan for source limit checks (default: standard)",
+    )
+    upload_parser.set_defaults(func=cmd_upload)
+
+    list_parser = subparsers.add_parser("list", help="List notebook sources")
+    list_parser.add_argument(
+        "--notebook-id",
+        type=str,
+        required=True,
+        help="NotebookLM notebook ID (required)",
+    )
+    list_parser.add_argument(
+        "--profile",
+        type=str,
+        default="default",
+        help="Auth profile name (default: default)",
+    )
+    list_parser.add_argument(
+        "--plan",
+        type=str,
+        default="standard",
+        choices=["standard", "pro", "ultra"],
+        help="NotebookLM plan for upload quota display (default: standard)",
+    )
+    list_parser.set_defaults(func=cmd_list)
+
+    remove_parser = subparsers.add_parser("remove", help="Remove one or more sources")
+    remove_group = remove_parser.add_mutually_exclusive_group(required=True)
+    remove_group.add_argument(
+        "--source-ids",
+        nargs="+",
+        help="One or more source IDs to remove",
+    )
+    remove_group.add_argument(
+        "--all",
+        dest="remove_all",
+        action="store_true",
+        help="Remove all sources from a notebook (requires --notebook-id)",
+    )
+    remove_parser.add_argument(
+        "--notebook-id",
+        type=str,
+        help="NotebookLM notebook ID (required with --all)",
+    )
+    remove_parser.add_argument(
+        "--profile",
+        type=str,
+        default="default",
+        help="Auth profile name (default: default)",
+    )
+    remove_parser.set_defaults(func=cmd_remove)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
+    args = parser.parse_args()
+    if not hasattr(args, "func"):
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        args.func(args)
+    except ClientAuthenticationError as exc:
+        profile_name = getattr(args, "profile", "default")
+        print_auth_error(profile_name, exc)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
