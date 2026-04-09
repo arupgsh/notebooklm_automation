@@ -1,5 +1,9 @@
 # NotebookLM Automation
 
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
+[![Build](https://img.shields.io/github/actions/workflow/status/arupgsh/notebooklm_automation/ci.yml?label=build)](https://github.com/arupgsh/notebooklm_automation/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/github/actions/workflow/status/arupgsh/notebooklm_automation/ci.yml?label=tests)](https://github.com/arupgsh/notebooklm_automation/actions/workflows/ci.yml)
+
 This repository provides two command-line tools built on top of [notebooklm-mcp-cli](https://github.com/jacob-bd/notebooklm-mcp-cli) to help automate parts of a systematic literature review workflow (for example, data extraction).
 
 
