@@ -2,179 +2,22 @@ import argparse
 import sys
 from pathlib import Path
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-
-from notebooklm_tools.core.auth import AuthManager
-from notebooklm_tools.core.client import NotebookLMClient
-from notebooklm_tools.core.errors import ClientAuthenticationError
 from notebooklm_tools.core.exceptions import NLMError
 from notebooklm_tools.services import sources as sources_service
 
-
-console = Console()
-err_console = Console(stderr=True)
-
-
-PLAN_LIMITS = {
-    "standard": 50,
-    "pro": 300,
-    "ultra": 600,
-}
-
-READY_STATUSES = {"ready", "available", "success", "present", "1", "2", "true", "yes"}
-
-
-def print_section(title: str, message: str) -> None:
-    console.print(Panel(message, title=title, border_style="blue"))
-
-
-def print_error(message: str) -> None:
-    err_console.print(f"[red]Error:[/red] {message}")
-
-
-def print_success(message: str) -> None:
-    console.print(f"[green]OK[/green] {message}")
-
-
-def print_warning(message: str) -> None:
-    console.print(f"[yellow]WARN[/yellow] {message}")
-
-
-def print_auth_error(profile_name: str, error: Exception) -> None:
-    console.print(
-        Panel(
-            f"[bold red]Authentication expired[/bold red]\n\n"
-            f"Profile: [cyan]{profile_name}[/cyan]\n"
-            f"Details: {error}\n\n"
-            f"Run [bold]nlm login --profile {profile_name}[/bold] and retry.",
-            title="Auth Error",
-            border_style="red",
-        )
-    )
-
-
-def print_quota_check(
-    profile_name: str,
-    notebook_id: str,
-    plan_name: str,
-    plan_limit: int,
-    existing_count: int,
-    requested_count: int | None = None,
-) -> None:
-    projected_total = existing_count + (requested_count or 0)
-    available_quota = max(plan_limit - existing_count, 0)
-
-    body_lines = [
-        f"[bold]Profile:[/bold] {profile_name}",
-        f"[bold]Notebook ID:[/bold] {notebook_id}",
-        f"[bold]Plan:[/bold] {plan_name} (max {plan_limit} sources)",
-        f"[bold]Existing sources:[/bold] {existing_count}",
-        f"[bold]Available upload quota:[/bold] {available_quota}",
-    ]
-    if requested_count is not None:
-        body_lines.extend(
-            [
-                f"[bold]Requested new uploads:[/bold] {requested_count}",
-                f"[bold]Projected total:[/bold] {projected_total}",
-            ]
-        )
-
-    console.print(Panel("\n".join(body_lines), title="Quota Check", border_style="blue"))
-
-
-def get_status_style(status: str) -> str:
-    normalized = status.strip().lower()
-    if normalized in READY_STATUSES:
-        return "green"
-    if normalized in {"failed", "fail", "error"}:
-        return "red"
-    if normalized in {"skipped", "duplicate", "existing"}:
-        return "yellow"
-    return "cyan"
-
-
-def render_sources_table(
-    sources: list[dict],
-    title: str = "Sources",
-    status_label: str = "available",
-) -> None:
-    table = Table(title=title, show_lines=False, header_style="bold magenta")
-    table.add_column("Source ID", style="dim", no_wrap=True)
-    table.add_column("File Name", style="bold")
-    table.add_column("Status", style="green", no_wrap=True)
-
-    if not sources:
-        console.print(table)
-        return
-
-    for source in sources:
-        file_name = str(source.get("title", "Untitled"))
-        raw_status = source.get("status", status_label)
-        status_value = str(raw_status)
-        status_style = get_status_style(status_value)
-        if raw_status == 2 or status_value.strip().lower() in READY_STATUSES:
-            status_display = "[green]✓[/green]"
-        else:
-            status_display = f"[{status_style}]{status_value}[/{status_style}]"
-        table.add_row(
-            str(source.get("id", "unknown")),
-            file_name,
-            status_display,
-        )
-
-    console.print(table)
-
-
-def get_authenticated_profile(profile_name: str):
-    """Load an auth profile with actionable errors."""
-    manager = AuthManager(profile_name)
-    if not manager.profile_exists():
-        raise SystemExit(
-            f"Profile '{profile_name}' not found. Run: nlm login --profile {profile_name}"
-        )
-
-    try:
-        profile = manager.load_profile()
-    except Exception as exc:
-        raise SystemExit(
-            f"Failed to load profile '{profile_name}': {exc}\n"
-            f"Try re-authenticating: nlm login --profile {profile_name}"
-        ) from exc
-
-    if not profile.cookies:
-        raise SystemExit(
-            f"Profile '{profile_name}' has no cookies. "
-            f"Run: nlm login --profile {profile_name}"
-        )
-
-    return profile
-
-
-def collect_pdf_files(folder: Path) -> list[Path]:
-    """Collect PDF files from a folder."""
-    resolved = folder.expanduser().resolve()
-    if not resolved.exists():
-        raise SystemExit(f"Folder not found: {resolved}")
-    if not resolved.is_dir():
-        raise SystemExit(f"Not a directory: {resolved}")
-
-    pdf_files = sorted(resolved.glob("*.pdf"))
-    if not pdf_files:
-        raise SystemExit(f"No PDF files found in: {resolved}")
-
-    return pdf_files
-
-
-def create_client(profile_name: str) -> NotebookLMClient:
-    profile = get_authenticated_profile(profile_name)
-    return NotebookLMClient(
-        cookies=profile.cookies,
-        csrf_token=profile.csrf_token or "",
-        session_id=profile.session_id or "",
-        build_label=profile.build_label or "",
-    )
+from helpers.auth import create_client
+from helpers.cli import run_cli_command
+from helpers.formatter import (
+    console,
+    err_console,
+    print_error,
+    print_quota_check,
+    print_section,
+    print_success,
+    print_warning,
+    render_sources_table,
+)
+from helpers.utils import PLAN_LIMITS, collect_pdf_files
 
 
 def cmd_upload(args: argparse.Namespace) -> None:
@@ -466,22 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     parser = build_parser()
-
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(0)
-
-    args = parser.parse_args()
-    if not hasattr(args, "func"):
-        parser.print_help()
-        sys.exit(1)
-
-    try:
-        args.func(args)
-    except ClientAuthenticationError as exc:
-        profile_name = getattr(args, "profile", "default")
-        print_auth_error(profile_name, exc)
-        sys.exit(1)
+    run_cli_command(parser)
 
 
 if __name__ == "__main__":

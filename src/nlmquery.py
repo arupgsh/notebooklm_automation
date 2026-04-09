@@ -1,189 +1,31 @@
 import argparse
-import json
-import re
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from rich.console import Console
-from rich.panel import Panel
-
-from notebooklm_tools.core.auth import AuthManager
 from notebooklm_tools.core.client import NotebookLMClient
-from notebooklm_tools.core.errors import ClientAuthenticationError
 from notebooklm_tools.services.chat import query_start, query_status
 
-
-console = Console()
-
-
-def print_auth_error(profile_name: str, error: Exception) -> None:
-    console.print(
-        Panel(
-            f"[bold red]Authentication expired[/bold red]\n\n"
-            f"Profile: [cyan]{profile_name}[/cyan]\n"
-            f"Details: {error}\n\n"
-            f"Run [bold]nlm login --profile {profile_name}[/bold] and retry.",
-            title="Auth Error",
-            border_style="red",
-        )
-    )
-
-
-def sanitize_filename(name: str) -> str:
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name).strip()
-    cleaned = cleaned.strip(".")
-    return cleaned or "untitled"
+from helpers.auth import create_client
+from helpers.cli import run_cli_command
+from helpers.formatter import (
+    console,
+    extract_answer_text,
+    get_model_version,
+)
+from helpers.utils import (
+    build_notebook_output_path,
+    build_source_output_path,
+    create_output_dir,
+    get_source_display_name,
+    get_source_file_name,
+    get_timestamp,
+    read_query_file,
+    save_query_result,
+)
 
 
-def ensure_unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-
-    stem = path.stem
-    suffix = path.suffix
-    parent = path.parent
-    counter = 2
-    while True:
-        candidate = parent / f"{stem}_{counter}{suffix}"
-        if not candidate.exists():
-            return candidate
-        counter += 1
-
-
-def build_source_output_path(output_dir: Path, source_file_name: str, source_id: str) -> Path:
-    filename = f"{sanitize_filename(source_file_name)}__{sanitize_filename(source_id)}.md"
-    return output_dir / filename
-
-
-def build_notebook_output_path(output_dir: Path, notebook_id: str) -> Path:
-    return output_dir / f"{sanitize_filename(notebook_id)}.md"
-
-
-def get_timestamp() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
-
-
-def read_query_file(query_file: Path) -> str:
-    if not query_file.exists() or not query_file.is_file():
-        raise SystemExit(f"Error: Query file not found: {query_file}")
-
-    content = query_file.read_text(encoding="utf-8").strip()
-    if not content:
-        raise SystemExit(f"Error: Query file is empty: {query_file}")
-    return content
-
-
-def create_output_dir(output_folder: str | None) -> Path:
-    output_dir = Path(output_folder) if output_folder else Path("output")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
-
-
-def get_source_file_name(source: dict) -> str:
-    title = str(source.get("title") or source.get("name") or source.get("id") or "source")
-    return Path(title).stem or "source"
-
-
-def get_source_display_name(source: dict) -> str:
-    title = str(source.get("title") or source.get("name") or source.get("id") or "source")
-    return title or "source"
-
-
-def get_model_version(result: Any) -> str | None:
-    if isinstance(result, dict):
-        for key in (
-            "model_version",
-            "modelVersion",
-            "model_name",
-            "modelName",
-            "version",
-        ):
-            value = result.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
-
-
-def get_authenticated_profile(profile_name: str):
-    manager = AuthManager(profile_name)
-    if not manager.profile_exists():
-        raise SystemExit(
-            f"Error: Profile '{profile_name}' not found. Run: nlm login --profile {profile_name}"
-        )
-
-    try:
-        profile = manager.load_profile()
-    except Exception as exc:
-        raise SystemExit(
-            f"Error: Failed to load profile '{profile_name}': {exc}\n"
-            f"Run: nlm login --profile {profile_name}"
-        ) from exc
-
-    if not profile.cookies:
-        raise SystemExit(
-            f"Error: Profile '{profile_name}' has no cookies. "
-            f"Run: nlm login --profile {profile_name}"
-        )
-
-    return profile
-
-
-def create_client(profile_name: str) -> NotebookLMClient:
-    profile = get_authenticated_profile(profile_name)
-    return NotebookLMClient(
-        cookies=profile.cookies,
-        csrf_token=profile.csrf_token or "",
-        session_id=profile.session_id or "",
-        build_label=profile.build_label or "",
-    )
-
-
-def extract_answer_text(result: Any) -> str:
-    if isinstance(result, str):
-        return result
-
-    if isinstance(result, dict):
-        for key in ("answer", "response", "text", "content", "output"):
-            value = result.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
-
-    try:
-        return json.dumps(result, indent=2, ensure_ascii=False)
-    except Exception:
-        return str(result)
-
-
-def save_query_result(
-    output_path: Path,
-    notebook_id: str,
-    source_ids: list[str],
-    source_file_names: list[str],
-    answer_text: str,
-    run_timestamp: str,
-    query_id: str | None = None,
-    response_id: str | None = None,
-    model_version: str | None = None,
-) -> None:
-    source_name_block = "\n".join(f"- {name}" for name in source_file_names) if source_file_names else "- all sources"
-    model_version_line = f"- Model version: {model_version}\n" if model_version else ""
-    query_id_line = f"- Query ID: {query_id or 'n/a'}\n"
-    response_id_line = f"- Response ID: {response_id or 'n/a'}\n"
-    body = (
-        f"# NotebookLM Query Result\n\n"
-        f"- Run timestamp: {run_timestamp}\n"
-        f"- Notebook ID: {notebook_id}\n"
-        f"{query_id_line}"
-        f"{response_id_line}"
-        f"- Sources: {', '.join(source_ids) if source_ids else 'all'}\n\n"
-        f"- Source file name(s):\n{source_name_block}\n\n"
-        f"{model_version_line}"
-        f"## Response\n\n{answer_text}\n"
-    )
-    output_path.write_text(body, encoding="utf-8")
 
 
 def wait_for_query_result(query_id: str) -> dict[str, Any]:
@@ -427,22 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     parser = build_parser()
-
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(0)
-
-    args = parser.parse_args()
-    if not hasattr(args, "func"):
-        parser.print_help()
-        sys.exit(1)
-
-    try:
-        args.func(args)
-    except ClientAuthenticationError as exc:
-        profile_name = getattr(args, "profile", "default")
-        print_auth_error(profile_name, exc)
-        sys.exit(1)
+    run_cli_command(parser)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,9 @@
+"""
+DEPRECATED: This module is deprecated. Use nlmsource.py instead.
+
+This is a legacy wrapper that calls the 'nlm source add' CLI command.
+Modern workflow should use nlmsource.py directly with the embedded Python API.
+"""
 import sys
 import os
 import argparse
