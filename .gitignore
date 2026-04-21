@@ -11,5 +11,5 @@ wheels/
 .venv
 
 # Test input and output folders
-data/
+test_data/
 output/
