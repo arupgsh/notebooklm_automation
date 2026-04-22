@@ -22,9 +22,10 @@ dev = [
 [project.scripts]
 nlmsource = "nlmsource:main"
 nlmquery = "nlmquery:main"
+nlmbatch = "nlmbatch:main"
 
 [tool.setuptools]
-py-modules = ["nlmsource", "nlmquery", "main", "command_line_wrapper"]
+py-modules = ["nlmsource", "nlmquery", "nlmbatch", "main", "command_line_wrapper"]
 
 [tool.setuptools.package-dir]
 "" = "src"
